@@ -24,11 +24,11 @@ const STATIC_ICE_CONFIG = {
 // These are accepted by the TURN server and won't get rate-limited.
 const fetchIceConfig = async () => {
     if (!METERED_API_KEY) {
-        console.warn("Metered API key missing. Using static OpenRelay ICE config.");
+        // console.warn("Metered API key missing. Using static OpenRelay ICE config.");
         return STATIC_ICE_CONFIG;
     }
 
-    console.log("Metered API key found. Fetching TURN credentials...");
+    // console.log("Metered API key found. Fetching TURN credentials...");
 
     try {
         const url = `https://peersdrop.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
@@ -37,7 +37,7 @@ const fetchIceConfig = async () => {
             signal: AbortSignal.timeout(6000)
         });
 
-        console.log("Metered credentials API status:", resp.status);
+        // console.log("Metered credentials API status:", resp.status);
 
         if (!resp.ok) {
             const text = await resp.text();
@@ -47,7 +47,7 @@ const fetchIceConfig = async () => {
 
         const iceServers = await resp.json();
 
-        console.log("Metered ICE servers received:", iceServers);
+        // console.log("Metered ICE servers received:", iceServers);
 
         return {
             iceServers: [
