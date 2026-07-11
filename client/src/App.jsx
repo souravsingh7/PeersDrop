@@ -3,7 +3,9 @@ import Peer from "peerjs";
 
 import "./App.css";
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB — safe across Chrome & Firefox, no DataChannel fragmentation
+const CHUNK_SIZE = 256 * 1024; // 256 KB — 4x fewer messages than 64KB, still well under every browser's real DataChannel message limit
+const BUFFER_HIGH_WATERMARK = 4 * 1024 * 1024; // pause sending once this much is queued
+const BUFFER_LOW_WATERMARK = 1 * 1024 * 1024; // resume once queue drains to this
 
 const METERED_API_KEY = import.meta.env.VITE_METERED_API_KEY;
 
@@ -24,11 +26,11 @@ const STATIC_ICE_CONFIG = {
 // These are accepted by the TURN server and won't get rate-limited.
 const fetchIceConfig = async () => {
     if (!METERED_API_KEY) {
-        // console.warn("Metered API key missing. Using static OpenRelay ICE config.");
+        console.warn("Metered API key missing. Using static OpenRelay ICE config.");
         return STATIC_ICE_CONFIG;
     }
 
-    // console.log("Metered API key found. Fetching TURN credentials...");
+    console.log("Metered API key found. Fetching TURN credentials...");
 
     try {
         const url = `https://peersdrop.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
@@ -37,7 +39,7 @@ const fetchIceConfig = async () => {
             signal: AbortSignal.timeout(6000)
         });
 
-        // console.log("Metered credentials API status:", resp.status);
+        console.log("Metered credentials API status:", resp.status);
 
         if (!resp.ok) {
             const text = await resp.text();
@@ -47,7 +49,7 @@ const fetchIceConfig = async () => {
 
         const iceServers = await resp.json();
 
-        // console.log("Metered ICE servers received:", iceServers);
+        console.log("Metered ICE servers received:", iceServers);
 
         return {
             iceServers: [
@@ -142,9 +144,37 @@ export default function App() {
                     setStatus("ICE connection failed. Network may be blocking P2P. Try a different network.");
                 } else if (s === "connected" || s === "completed") {
                     clearTimeout(connTimeoutRef.current);
+                    logConnectionType(pc);
                 }
             };
         }, 500);
+    };
+
+    // Lets you see, in the log panel, whether the transfer is direct P2P
+    // (fast) or relayed through the TURN server (slow, bandwidth-capped by
+    // that server — no chunk-size tuning fixes that).
+    const logConnectionType = async (pc) => {
+        try {
+            const stats = await pc.getStats();
+            let activePair = null;
+            stats.forEach((report) => {
+                if (report.type === "candidate-pair" && report.state === "succeeded" && report.nominated) {
+                    activePair = report;
+                }
+            });
+            if (!activePair) return;
+
+            const local = stats.get(activePair.localCandidateId);
+            const remote = stats.get(activePair.remoteCandidateId);
+
+            if (local?.candidateType === "relay" || remote?.candidateType === "relay") {
+                addLog("⚠ Connection is relayed via TURN — transfer speed is capped by the relay server, not the app.");
+            } else {
+                addLog("✓ Direct P2P connection — good for max transfer speed.");
+            }
+        } catch (err) {
+            // getStats can fail mid-negotiation on some browsers; not critical
+        }
     };
 
     const copyRoomId = () => {
@@ -283,24 +313,41 @@ export default function App() {
         }));
 
         const arrayBuffer = await selectedFile.arrayBuffer();
+        const dc = conn.dataChannel;
+        if (dc) dc.bufferedAmountLowThreshold = BUFFER_LOW_WATERMARK;
 
-        // Every file is sent in 64 KB chunks with backpressure
+        // Waits for the 'bufferedamountlow' event instead of polling on a timer —
+        // fires the instant the channel drains, no dead time between chunks.
+        const waitForDrain = () =>
+            new Promise((resolve) => {
+                if (!dc || dc.bufferedAmount <= BUFFER_LOW_WATERMARK) {
+                    resolve();
+                    return;
+                }
+                const onLow = () => {
+                    dc.removeEventListener("bufferedamountlow", onLow);
+                    resolve();
+                };
+                dc.addEventListener("bufferedamountlow", onLow);
+            });
+
         let offset = 0;
+        let lastProgress = 0;
         while (offset < arrayBuffer.byteLength) {
             const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
             conn.send(chunk);
             offset += chunk.byteLength;
-            setSendProgress(Math.round((offset / arrayBuffer.byteLength) * 100));
 
-            const dc = conn.dataChannel;
-            if (dc && dc.bufferedAmount > 1024 * 1024) {
-                await new Promise((resolve) => {
-                    const check = () => {
-                        if (!dc || dc.bufferedAmount < 512 * 1024) resolve();
-                        else setTimeout(check, 50);
-                    };
-                    check();
-                });
+            // Only touch React state when the displayed % actually changes —
+            // re-rendering on every chunk competes with sending for main-thread time.
+            const pct = Math.round((offset / arrayBuffer.byteLength) * 100);
+            if (pct > lastProgress) {
+                lastProgress = pct;
+                setSendProgress(pct);
+            }
+
+            if (dc && dc.bufferedAmount > BUFFER_HIGH_WATERMARK) {
+                await waitForDrain();
             }
         }
         conn.send(JSON.stringify({ type: "file-complete" }));
