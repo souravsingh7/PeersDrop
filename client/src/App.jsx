@@ -3,26 +3,13 @@ import Peer from "peerjs";
 
 import "./App.css";
 
-const CHUNK_SIZE = 256 * 1024; // 256 KB — still safe across Chrome & Firefox, 4x fewer messages than 64 KB
-const BUFFER_HIGH_WATERMARK = 4 * 1024 * 1024; // pause sending once this much is queued
-const BUFFER_LOW_WATERMARK = 1 * 1024 * 1024; // resume once queue drains to this
+const CHUNK_SIZE = 64 * 1024; // 64 KB — safe across Chrome & Firefox, no DataChannel fragmentation
 
 const METERED_API_KEY = import.meta.env.VITE_METERED_API_KEY;
 
-// First attempt: STUN only, no TURN. If this succeeds, the connection is
-// direct P2P — fast, and free. Most connections on normal home networks
-// succeed this way.
-const STUN_ONLY_CONFIG = {
-    iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-    ]
-};
-
-// Fallback only: used when STUN-only ICE fails (symmetric NAT / restrictive
-// firewall on one or both sides means a direct path is impossible).
+// Hardcoded TURN servers — used when no API key is configured.
 // openrelay.metered.ca accepts these credentials directly on the TURN server.
-const STATIC_TURN_FALLBACK_CONFIG = {
+const STATIC_ICE_CONFIG = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
@@ -33,13 +20,15 @@ const STATIC_TURN_FALLBACK_CONFIG = {
     ]
 };
 
-// Only called as a fallback, after STUN-only ICE has failed. When a real
-// Metered.ca API key is set, fetch short-lived signed TURN credentials
-// (better bandwidth than the free static ones). Otherwise use the static list.
-const fetchTurnFallbackConfig = async () => {
+// When a real Metered.ca API key is set, fetch short-lived signed credentials.
+// These are accepted by the TURN server and won't get rate-limited.
+const fetchIceConfig = async () => {
     if (!METERED_API_KEY) {
-        return STATIC_TURN_FALLBACK_CONFIG;
+        console.warn("Metered API key missing. Using static OpenRelay ICE config.");
+        return STATIC_ICE_CONFIG;
     }
+
+    console.log("Metered API key found. Fetching TURN credentials...");
 
     try {
         const url = `https://peersdrop.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
@@ -48,12 +37,17 @@ const fetchTurnFallbackConfig = async () => {
             signal: AbortSignal.timeout(6000)
         });
 
+        console.log("Metered credentials API status:", resp.status);
+
         if (!resp.ok) {
             const text = await resp.text();
+            console.error("Metered API failed:", text);
             throw new Error(`Metered API bad response: ${resp.status}`);
         }
 
         const iceServers = await resp.json();
+
+        console.log("Metered ICE servers received:", iceServers);
 
         return {
             iceServers: [
@@ -62,8 +56,8 @@ const fetchTurnFallbackConfig = async () => {
             ]
         };
     } catch (err) {
-        console.error("Failed to fetch Metered TURN credentials. Falling back to static TURN config.", err);
-        return STATIC_TURN_FALLBACK_CONFIG;
+        console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
+        return STATIC_ICE_CONFIG;
     }
 };
 
@@ -92,9 +86,6 @@ export default function App() {
     const peerRef = useRef(null);
     const connRef = useRef(null);
     const connTimeoutRef = useRef(null);
-    const fallbackAttemptedRef = useRef(false);
-    const joinRetryCountRef = useRef(0);
-    const targetRoomIdRef = useRef("");
 
     const receiveMetaRef = useRef(null);
     const receivedChunksRef = useRef([]);
@@ -105,7 +96,7 @@ export default function App() {
         setLogs((prev) => [`${new Date().toLocaleTimeString()} - ${message}`, ...prev]);
     };
 
-    const setupConnection = (conn, onIceFailed) => {
+    const setupConnection = (conn) => {
         if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
 
         const onOpen = () => {
@@ -148,47 +139,12 @@ export default function App() {
                 const s = pc.iceConnectionState;
                 if (s === "failed") {
                     clearTimeout(connTimeoutRef.current);
-                    if (onIceFailed && !fallbackAttemptedRef.current) {
-                        fallbackAttemptedRef.current = true;
-                        onIceFailed();
-                    } else {
-                        setStatus("ICE connection failed. Network may be blocking P2P. Try a different network.");
-                    }
+                    setStatus("ICE connection failed. Network may be blocking P2P. Try a different network.");
                 } else if (s === "connected" || s === "completed") {
                     clearTimeout(connTimeoutRef.current);
-                    logConnectionType(pc);
                 }
             };
         }, 500);
-    };
-
-    // Tells you whether the transfer will be fast (direct P2P) or slow (relayed
-    // through the free TURN server, which is bandwidth-capped and shared by
-    // everyone using it). This is the #1 cause of "why is my transfer so slow".
-    const logConnectionType = async (pc) => {
-        try {
-            const stats = await pc.getStats();
-            let activePair = null;
-            stats.forEach((report) => {
-                if (report.type === "candidate-pair" && report.state === "succeeded" && report.nominated) {
-                    activePair = report;
-                }
-            });
-            if (!activePair) return;
-
-            const local = stats.get(activePair.localCandidateId);
-            const remote = stats.get(activePair.remoteCandidateId);
-            const localType = local?.candidateType;
-            const remoteType = remote?.candidateType;
-
-            if (localType === "relay" || remoteType === "relay") {
-                addLog(`⚠ Connection is RELAYED via TURN (local=${localType}, remote=${remoteType}). Transfer will be slow — capped by the free relay server's bandwidth, not your code or connection.`);
-            } else {
-                addLog(`✓ Direct P2P connection (local=${localType}, remote=${remoteType}). Transfer should be fast.`);
-            }
-        } catch (err) {
-            // getStats can fail on some browsers mid-negotiation; not critical
-        }
     };
 
     const copyRoomId = () => {
@@ -198,31 +154,26 @@ export default function App() {
         });
     };
 
-    const createRoom = async (retryId, forceTurn = false) => {
+    const createRoom = async (retryId) => {
         const newId = typeof retryId === "string" ? retryId : generateRoomId();
         setMode("create");
+        setStatus("Getting TURN credentials...");
 
-        if (forceTurn) {
-            setStatus("Direct connection failed — getting TURN relay credentials...");
-        } else {
-            setStatus("Connecting (direct P2P)...");
-        }
+        const iceConfig = await fetchIceConfig();
 
-        const iceConfig = forceTurn ? await fetchTurnFallbackConfig() : STUN_ONLY_CONFIG;
-
-        const peer = new Peer(newId, { config: iceConfig, debug: 2 });
+        const peer = new Peer(newId, { config: iceConfig });
         peerRef.current = peer;
 
         peer.on("open", (id) => {
             setRoomId(id);
             setJoined(true);
-            setStatus(forceTurn ? "Waiting for peer (relay mode)..." : "Waiting for peer...");
-            addLog(`Room created: "${id}" (${id.length} chars)${forceTurn ? " — using TURN relay (fallback)" : " — attempting direct P2P"}`);
+            setStatus("Waiting for peer...");
+            addLog(`Room created: ${id}`);
         });
 
         peer.on("connection", (conn) => {
             connRef.current = conn;
-            setupConnection(conn, forceTurn ? null : () => retryCreateWithTurn(newId));
+            setupConnection(conn);
             addLog("Peer connected to room");
             setStatus("Peer found, connecting...");
         });
@@ -232,120 +183,45 @@ export default function App() {
             if (err.type === "unavailable-id") {
                 // Auto-retry with a fresh code on collision
                 peer.destroy();
-                createRoom(undefined, forceTurn);
+                createRoom();
             } else {
                 setStatus(`Error: ${err.message}`);
             }
         });
-
-        // PeerJS keeps a signaling socket open to stay reachable by ID. If it
-        // drops (flaky network, tab backgrounded, phone sleep) it does NOT
-        // auto-reconnect — the room silently becomes invisible to joiners
-        // while the UI still says "Waiting for peer...". Watch for that and
-        // recover automatically.
-        peer.on("disconnected", () => {
-            addLog("⚠ Lost connection to signaling server — room ID is temporarily unreachable. Reconnecting...");
-            setStatus("Reconnecting to signaling server...");
-            if (!peer.destroyed) peer.reconnect();
-        });
-
-        peer.on("close", () => {
-            addLog("Signaling connection closed — room is no longer reachable.");
-            setStatus("Room closed. Create a new room to continue.");
-        });
     };
 
-    // Called only when the STUN-only attempt fails ICE negotiation. Tears down
-    // the STUN-only peer and recreates the room with the same ID, this time
-    // including TURN — so the joiner can reconnect to the same code.
-    const retryCreateWithTurn = (previousId) => {
-        addLog("Direct P2P failed — falling back to TURN relay (this will be slower).");
-        if (peerRef.current) {
-            peerRef.current.destroy();
-            peerRef.current = null;
-        }
-        setTimeout(() => createRoom(previousId, true), 500);
-    };
-
-    const joinRoom = async (forceTurn = false) => {
-        if (!forceTurn) {
-            targetRoomIdRef.current = joinInput.trim().toLowerCase();
-        }
-        const id = targetRoomIdRef.current;
+    const joinRoom = async () => {
+        const id = joinInput.trim().toLowerCase();
         if (!id) {
             alert("Please enter a room ID");
             return;
         }
 
-        if (forceTurn) {
-            setStatus("Direct connection failed — getting TURN relay credentials...");
-        } else {
-            setStatus("Connecting (direct P2P)...");
-        }
+        setStatus("Getting TURN credentials...");
+        const iceConfig = await fetchIceConfig();
 
-        const iceConfig = forceTurn ? await fetchTurnFallbackConfig() : STUN_ONLY_CONFIG;
-
-        // debug: 2 makes PeerJS log every signaling message (offers, answers,
-        // errors) to the browser console — open DevTools console to see the
-        // raw exchange if this still fails.
-        const peer = new Peer(undefined, { config: iceConfig, debug: 2 });
+        const peer = new Peer(undefined, { config: iceConfig });
         peerRef.current = peer;
         setMode("join");
 
-        addLog(`Target room ID: "${id}" (${id.length} chars)`);
-
-        peer.on("open", (myOwnId) => {
+        peer.on("open", () => {
             setRoomId(id);
             setJoined(true);
-            setStatus(forceTurn ? "Reconnecting via relay..." : "Connecting to peer...");
-            addLog(`My signaling ID: ${myOwnId}. Dialing "${id}"${forceTurn ? " — using TURN relay (fallback)" : " — attempting direct P2P"}`);
+            setStatus("Connecting to peer...");
+            addLog(`Connecting to room: ${id}`);
 
             const conn = peer.connect(id, { reliable: true });
             connRef.current = conn;
-            setupConnection(conn, forceTurn ? null : () => retryJoinWithTurn());
+            setupConnection(conn);
         });
 
         peer.on("error", (err) => {
-            addLog(`Error: ${err.type} — ${err.message}`);
+            addLog(`Error: ${err.message}`);
             if (err.type === "peer-unavailable") {
-                // Two situations land here:
-                // 1) First attempt, right after the other person hit "Create
-                //    Room" — the ID can take a moment to propagate on
-                //    PeerJS's signaling server. A couple of quick retries
-                //    absorbs that without bothering the user.
-                // 2) TURN fallback — the room creator may still be tearing
-                //    down and recreating its peer with the same ID.
-                if (joinRetryCountRef.current < 5) {
-                    joinRetryCountRef.current += 1;
-                    addLog(`Retry ${joinRetryCountRef.current}/5 — peer server says "${id}" isn't registered yet, trying again...`);
-                    setTimeout(() => joinRoom(forceTurn), 1200);
-                } else {
-                    alert("Room not found. Double-check the room ID (no extra spaces) and that the other person still has the room open.");
-                    disconnect();
-                }
+                alert("Room not found. Check the room ID and try again.");
+                disconnect();
             }
         });
-
-        peer.on("disconnected", () => {
-            addLog("⚠ Lost connection to signaling server. Reconnecting...");
-            setStatus("Reconnecting to signaling server...");
-            if (!peer.destroyed) peer.reconnect();
-        });
-
-        peer.on("close", () => {
-            addLog("Signaling connection closed.");
-        });
-    };
-
-    // Called only when the STUN-only attempt fails ICE negotiation.
-    const retryJoinWithTurn = () => {
-        addLog("Direct P2P failed — falling back to TURN relay (this will be slower).");
-        joinRetryCountRef.current = 0;
-        if (peerRef.current) {
-            peerRef.current.destroy();
-            peerRef.current = null;
-        }
-        setTimeout(() => joinRoom(true), 500);
     };
 
     const handleData = (data) => {
@@ -407,42 +283,24 @@ export default function App() {
         }));
 
         const arrayBuffer = await selectedFile.arrayBuffer();
-        const dc = conn.dataChannel;
-        if (dc) dc.bufferedAmountLowThreshold = BUFFER_LOW_WATERMARK;
 
-        // Waits for the 'bufferedamountlow' event instead of polling on a timer —
-        // fires the instant the channel drains, no dead time between chunks.
-        const waitForDrain = () =>
-            new Promise((resolve) => {
-                if (!dc || dc.bufferedAmount <= BUFFER_LOW_WATERMARK) {
-                    resolve();
-                    return;
-                }
-                const onLow = () => {
-                    dc.removeEventListener("bufferedamountlow", onLow);
-                    resolve();
-                };
-                dc.addEventListener("bufferedamountlow", onLow);
-            });
-
+        // Every file is sent in 64 KB chunks with backpressure
         let offset = 0;
-        let lastProgress = 0;
         while (offset < arrayBuffer.byteLength) {
             const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
             conn.send(chunk);
             offset += chunk.byteLength;
+            setSendProgress(Math.round((offset / arrayBuffer.byteLength) * 100));
 
-            // Only touch React state when the displayed % actually changes —
-            // re-rendering on every one of ~40 chunks (instead of every 64KB
-            // chunk) keeps the main thread free to keep sending.
-            const pct = Math.round((offset / arrayBuffer.byteLength) * 100);
-            if (pct > lastProgress) {
-                lastProgress = pct;
-                setSendProgress(pct);
-            }
-
-            if (dc && dc.bufferedAmount > BUFFER_HIGH_WATERMARK) {
-                await waitForDrain();
+            const dc = conn.dataChannel;
+            if (dc && dc.bufferedAmount > 1024 * 1024) {
+                await new Promise((resolve) => {
+                    const check = () => {
+                        if (!dc || dc.bufferedAmount < 512 * 1024) resolve();
+                        else setTimeout(check, 50);
+                    };
+                    check();
+                });
             }
         }
         conn.send(JSON.stringify({ type: "file-complete" }));
@@ -473,9 +331,6 @@ export default function App() {
         setSendProgress(0);
         setReceiveProgress(0);
         setReceivedFile(null);
-        fallbackAttemptedRef.current = false;
-        joinRetryCountRef.current = 0;
-        targetRoomIdRef.current = "";
         addLog("Disconnected");
     };
 
