@@ -210,14 +210,14 @@ export default function App() {
 
         const iceConfig = forceTurn ? await fetchTurnFallbackConfig() : STUN_ONLY_CONFIG;
 
-        const peer = new Peer(newId, { config: iceConfig });
+        const peer = new Peer(newId, { config: iceConfig, debug: 2 });
         peerRef.current = peer;
 
         peer.on("open", (id) => {
             setRoomId(id);
             setJoined(true);
             setStatus(forceTurn ? "Waiting for peer (relay mode)..." : "Waiting for peer...");
-            addLog(`Room created: ${id}${forceTurn ? " — using TURN relay (fallback)" : " — attempting direct P2P"}`);
+            addLog(`Room created: "${id}" (${id.length} chars)${forceTurn ? " — using TURN relay (fallback)" : " — attempting direct P2P"}`);
         });
 
         peer.on("connection", (conn) => {
@@ -236,6 +236,22 @@ export default function App() {
             } else {
                 setStatus(`Error: ${err.message}`);
             }
+        });
+
+        // PeerJS keeps a signaling socket open to stay reachable by ID. If it
+        // drops (flaky network, tab backgrounded, phone sleep) it does NOT
+        // auto-reconnect — the room silently becomes invisible to joiners
+        // while the UI still says "Waiting for peer...". Watch for that and
+        // recover automatically.
+        peer.on("disconnected", () => {
+            addLog("⚠ Lost connection to signaling server — room ID is temporarily unreachable. Reconnecting...");
+            setStatus("Reconnecting to signaling server...");
+            if (!peer.destroyed) peer.reconnect();
+        });
+
+        peer.on("close", () => {
+            addLog("Signaling connection closed — room is no longer reachable.");
+            setStatus("Room closed. Create a new room to continue.");
         });
     };
 
@@ -269,15 +285,20 @@ export default function App() {
 
         const iceConfig = forceTurn ? await fetchTurnFallbackConfig() : STUN_ONLY_CONFIG;
 
-        const peer = new Peer(undefined, { config: iceConfig });
+        // debug: 2 makes PeerJS log every signaling message (offers, answers,
+        // errors) to the browser console — open DevTools console to see the
+        // raw exchange if this still fails.
+        const peer = new Peer(undefined, { config: iceConfig, debug: 2 });
         peerRef.current = peer;
         setMode("join");
 
-        peer.on("open", () => {
+        addLog(`Target room ID: "${id}" (${id.length} chars)`);
+
+        peer.on("open", (myOwnId) => {
             setRoomId(id);
             setJoined(true);
             setStatus(forceTurn ? "Reconnecting via relay..." : "Connecting to peer...");
-            addLog(`Connecting to room: ${id}${forceTurn ? " — using TURN relay (fallback)" : " — attempting direct P2P"}`);
+            addLog(`My signaling ID: ${myOwnId}. Dialing "${id}"${forceTurn ? " — using TURN relay (fallback)" : " — attempting direct P2P"}`);
 
             const conn = peer.connect(id, { reliable: true });
             connRef.current = conn;
@@ -285,7 +306,7 @@ export default function App() {
         });
 
         peer.on("error", (err) => {
-            addLog(`Error: ${err.message}`);
+            addLog(`Error: ${err.type} — ${err.message}`);
             if (err.type === "peer-unavailable") {
                 // Two situations land here:
                 // 1) First attempt, right after the other person hit "Create
@@ -294,14 +315,25 @@ export default function App() {
                 //    absorbs that without bothering the user.
                 // 2) TURN fallback — the room creator may still be tearing
                 //    down and recreating its peer with the same ID.
-                if (joinRetryCountRef.current < 3) {
+                if (joinRetryCountRef.current < 5) {
                     joinRetryCountRef.current += 1;
-                    setTimeout(() => joinRoom(forceTurn), 1000);
+                    addLog(`Retry ${joinRetryCountRef.current}/5 — peer server says "${id}" isn't registered yet, trying again...`);
+                    setTimeout(() => joinRoom(forceTurn), 1200);
                 } else {
                     alert("Room not found. Double-check the room ID (no extra spaces) and that the other person still has the room open.");
                     disconnect();
                 }
             }
+        });
+
+        peer.on("disconnected", () => {
+            addLog("⚠ Lost connection to signaling server. Reconnecting...");
+            setStatus("Reconnecting to signaling server...");
+            if (!peer.destroyed) peer.reconnect();
+        });
+
+        peer.on("close", () => {
+            addLog("Signaling connection closed.");
         });
     };
 
