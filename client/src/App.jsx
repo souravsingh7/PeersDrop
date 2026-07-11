@@ -28,7 +28,7 @@ const fetchIceConfig = async () => {
         return STATIC_ICE_CONFIG;
     }
 
-    console.log("Metered API key found. Fetching TURN credentials...");
+    // console.log("Metered API key found. Fetching TURN credentials...");
 
     try {
         const url = `https://peersdrop.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
