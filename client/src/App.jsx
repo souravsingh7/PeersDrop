@@ -37,17 +37,17 @@ const fetchIceConfig = async () => {
             signal: AbortSignal.timeout(6000)
         });
 
-        console.log("Metered credentials API status:", resp.status);
+        // console.log("Metered credentials API status:", resp.status);
 
         if (!resp.ok) {
             const text = await resp.text();
-            console.error("Metered API failed:", text);
+            // console.error("Metered API failed:", text);
             throw new Error(`Metered API bad response: ${resp.status}`);
         }
 
         const iceServers = await resp.json();
 
-        console.log("Metered ICE servers received:", iceServers);
+        // console.log("Metered ICE servers received:", iceServers);
 
         return {
             iceServers: [
@@ -56,7 +56,7 @@ const fetchIceConfig = async () => {
             ]
         };
     } catch (err) {
-        console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
+        // console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
         return STATIC_ICE_CONFIG;
     }
 };
