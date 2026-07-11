@@ -3,8 +3,7 @@ import Peer from "peerjs";
 
 import "./App.css";
 
-const CHUNK_SIZE = 256 * 1024;         // 256 KB per chunk — 4× fewer iterations vs 64 KB
-const CHUNK_THRESHOLD = 100 * 1024 * 1024; // 100 MB — files above this get chunked; smaller files go direct (fastest)
+const CHUNK_SIZE = 64 * 1024; // 64 KB — safe across Chrome & Firefox, no DataChannel fragmentation
 
 const METERED_API_KEY = import.meta.env.VITE_METERED_API_KEY;
 
@@ -48,7 +47,7 @@ const fetchIceConfig = async () => {
 
         const iceServers = await resp.json();
 
-        //////////  // console.log("Metered ICE servers received:", iceServers);
+        // console.log("Metered ICE servers received:", iceServers);
 
         return {
             iceServers: [
@@ -57,7 +56,7 @@ const fetchIceConfig = async () => {
             ]
         };
     } catch (err) {
-        // console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
+        console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
         return STATIC_ICE_CONFIG;
     }
 };
@@ -92,7 +91,6 @@ export default function App() {
     const receivedChunksRef = useRef([]);
     const receivedSizeRef = useRef(0);
     const lastReceiveProgressRef = useRef(0);
-    const receiveAnimRef = useRef(null);
 
     const addLog = (message) => {
         setLogs((prev) => [`${new Date().toLocaleTimeString()} - ${message}`, ...prev]);
@@ -236,24 +234,10 @@ export default function App() {
                 receivedSizeRef.current = 0;
                 lastReceiveProgressRef.current = 0;
                 setReceiveProgress(0);
-                addLog(`Receiving: ${message.name} (${message.chunked ? "chunked" : "direct"})`);
-
-                // For direct (one-shot) transfers the receiver only gets a single
-                // binary event so real progress isn't possible. Animate 0→90% while
-                // waiting so the bar is visually active, then snap to 100% on arrival.
-                if (!message.chunked) {
-                    if (receiveAnimRef.current) clearInterval(receiveAnimRef.current);
-                    let fakeP = 0;
-                    receiveAnimRef.current = setInterval(() => {
-                        fakeP = Math.min(fakeP + 2, 90);
-                        setReceiveProgress(fakeP);
-                        if (fakeP >= 90) clearInterval(receiveAnimRef.current);
-                    }, 80);
-                }
+                addLog(`Receiving: ${message.name}`);
             }
 
             if (message.type === "file-complete") {
-                // Chunked transfer finished — assemble blob
                 const meta = receiveMetaRef.current;
                 const blob = new Blob(receivedChunksRef.current, { type: meta.mimeType || "application/octet-stream" });
                 const url = URL.createObjectURL(blob);
@@ -267,7 +251,7 @@ export default function App() {
             return;
         }
 
-        // Binary data received
+        // Binary chunk received — accumulate
         const meta = receiveMetaRef.current;
         if (!meta) return;
 
@@ -275,25 +259,12 @@ export default function App() {
             ? data
             : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 
-        if (!meta.chunked) {
-            // Direct transfer — entire file in one binary message
-            if (receiveAnimRef.current) { clearInterval(receiveAnimRef.current); receiveAnimRef.current = null; }
-            const blob = new Blob([buffer], { type: meta.mimeType || "application/octet-stream" });
-            const url = URL.createObjectURL(blob);
-            setReceivedFile({ url, name: meta.name });
-            setReceiveProgress(100);
-            addLog(`File ready: ${meta.name}`);
-            receiveMetaRef.current = null;
-        } else {
-            // Chunked transfer — accumulate until file-complete
-            receivedChunksRef.current.push(buffer);
-            receivedSizeRef.current += buffer.byteLength;
-            const pct = Math.round((receivedSizeRef.current / meta.size) * 100);
-            // Only update state when % actually increases to avoid React batching drops
-            if (pct > lastReceiveProgressRef.current) {
-                lastReceiveProgressRef.current = pct;
-                setReceiveProgress(pct);
-            }
+        receivedChunksRef.current.push(buffer);
+        receivedSizeRef.current += buffer.byteLength;
+        const pct = Math.round((receivedSizeRef.current / meta.size) * 100);
+        if (pct > lastReceiveProgressRef.current) {
+            lastReceiveProgressRef.current = pct;
+            setReceiveProgress(pct);
         }
     };
 
@@ -302,7 +273,6 @@ export default function App() {
         if (!conn || !channelOpen) { alert("Not connected yet"); return; }
         if (!selectedFile) { alert("Please select a file"); return; }
 
-        const isChunked = selectedFile.size > CHUNK_THRESHOLD;
         setSendProgress(0);
 
         conn.send(JSON.stringify({
@@ -310,57 +280,36 @@ export default function App() {
             name: selectedFile.name,
             size: selectedFile.size,
             mimeType: selectedFile.type,
-            chunked: isChunked
         }));
 
-        // Read file into memory — use FileReader so we get onprogress events.
-        // For direct sends this gives real read progress (0→90%); conn.send() is
-        // then instant from JS perspective so we jump straight to 100%.
-        const arrayBuffer = await new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onprogress = (e) => {
-                if (e.lengthComputable) {
-                    setSendProgress(Math.round((e.loaded / e.total) * 90));
-                }
-            };
-            reader.onload = (e) => resolve(e.target.result);
-            reader.onerror = () => reject(reader.error);
-            reader.readAsArrayBuffer(selectedFile);
-        });
+        const arrayBuffer = await selectedFile.arrayBuffer();
 
-        if (!isChunked) {
-            // ≤ 5 MB — send whole file in one shot for max speed
-            conn.send(arrayBuffer);
-            setSendProgress(100);
-        } else {
-            // > 100 MB — send in 64 KB chunks with backpressure
-            let offset = 0;
-            while (offset < arrayBuffer.byteLength) {
-                const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
-                conn.send(chunk);
-                offset += chunk.byteLength;
-                setSendProgress(Math.round((offset / arrayBuffer.byteLength) * 100));
+        // Every file is sent in 64 KB chunks with backpressure
+        let offset = 0;
+        while (offset < arrayBuffer.byteLength) {
+            const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
+            conn.send(chunk);
+            offset += chunk.byteLength;
+            setSendProgress(Math.round((offset / arrayBuffer.byteLength) * 100));
 
-                const dc = conn.dataChannel;
-                if (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
-                    await new Promise((resolve) => {
-                        const check = () => {
-                            if (!dc || dc.bufferedAmount < 2 * 1024 * 1024) resolve();
-                            else setTimeout(check, 30);
-                        };
-                        check();
-                    });
-                }
+            const dc = conn.dataChannel;
+            if (dc && dc.bufferedAmount > 1024 * 1024) {
+                await new Promise((resolve) => {
+                    const check = () => {
+                        if (!dc || dc.bufferedAmount < 512 * 1024) resolve();
+                        else setTimeout(check, 50);
+                    };
+                    check();
+                });
             }
-            conn.send(JSON.stringify({ type: "file-complete" }));
         }
+        conn.send(JSON.stringify({ type: "file-complete" }));
 
         addLog(`File sent: ${selectedFile.name}`);
     };
 
     const cleanupPeer = () => {
         clearTimeout(connTimeoutRef.current);
-        if (receiveAnimRef.current) { clearInterval(receiveAnimRef.current); receiveAnimRef.current = null; }
         if (connRef.current) {
             connRef.current.close();
             connRef.current = null;
