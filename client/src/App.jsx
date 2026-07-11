@@ -94,6 +94,7 @@ export default function App() {
     const connTimeoutRef = useRef(null);
     const fallbackAttemptedRef = useRef(false);
     const joinRetryCountRef = useRef(0);
+    const targetRoomIdRef = useRef("");
 
     const receiveMetaRef = useRef(null);
     const receivedChunksRef = useRef([]);
@@ -251,7 +252,10 @@ export default function App() {
     };
 
     const joinRoom = async (forceTurn = false) => {
-        const id = (forceTurn ? roomId : joinInput.trim().toLowerCase());
+        if (!forceTurn) {
+            targetRoomIdRef.current = joinInput.trim().toLowerCase();
+        }
+        const id = targetRoomIdRef.current;
         if (!id) {
             alert("Please enter a room ID");
             return;
@@ -283,14 +287,18 @@ export default function App() {
         peer.on("error", (err) => {
             addLog(`Error: ${err.message}`);
             if (err.type === "peer-unavailable") {
-                // During TURN fallback, the room creator may still be tearing
-                // down and recreating its peer — give it a couple of short
-                // retries before giving up.
-                if (forceTurn && joinRetryCountRef.current < 3) {
+                // Two situations land here:
+                // 1) First attempt, right after the other person hit "Create
+                //    Room" — the ID can take a moment to propagate on
+                //    PeerJS's signaling server. A couple of quick retries
+                //    absorbs that without bothering the user.
+                // 2) TURN fallback — the room creator may still be tearing
+                //    down and recreating its peer with the same ID.
+                if (joinRetryCountRef.current < 3) {
                     joinRetryCountRef.current += 1;
-                    setTimeout(() => joinRoom(true), 1000);
+                    setTimeout(() => joinRoom(forceTurn), 1000);
                 } else {
-                    alert("Room not found. Check the room ID and try again.");
+                    alert("Room not found. Double-check the room ID (no extra spaces) and that the other person still has the room open.");
                     disconnect();
                 }
             }
@@ -435,6 +443,7 @@ export default function App() {
         setReceivedFile(null);
         fallbackAttemptedRef.current = false;
         joinRetryCountRef.current = 0;
+        targetRoomIdRef.current = "";
         addLog("Disconnected");
     };
 
