@@ -3,7 +3,8 @@ import Peer from "peerjs";
 
 import "./App.css";
 
-const CHUNK_SIZE = 16 * 1024;
+const CHUNK_SIZE = 64 * 1024;          // 64 KB per chunk (used for large files)
+const CHUNK_THRESHOLD = 100 * 1024 * 1024; // 100 MB — files above this get chunked
 
 const METERED_API_KEY = import.meta.env.VITE_METERED_API_KEY;
 
@@ -28,7 +29,7 @@ const fetchIceConfig = async () => {
         return STATIC_ICE_CONFIG;
     }
 
-    // console.log("Metered API key found. Fetching TURN credentials...");
+    console.log("Metered API key found. Fetching TURN credentials...");
 
     try {
         const url = `https://peersdrop.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
@@ -37,17 +38,17 @@ const fetchIceConfig = async () => {
             signal: AbortSignal.timeout(6000)
         });
 
-        // console.log("Metered credentials API status:", resp.status);
+        console.log("Metered credentials API status:", resp.status);
 
         if (!resp.ok) {
             const text = await resp.text();
-            // console.error("Metered API failed:", text);
+            console.error("Metered API failed:", text);
             throw new Error(`Metered API bad response: ${resp.status}`);
         }
 
         const iceServers = await resp.json();
 
-        // console.log("Metered ICE servers received:", iceServers);
+        console.log("Metered ICE servers received:", iceServers);
 
         return {
             iceServers: [
@@ -56,7 +57,7 @@ const fetchIceConfig = async () => {
             ]
         };
     } catch (err) {
-        // console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
+        console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
         return STATIC_ICE_CONFIG;
     }
 };
@@ -81,6 +82,7 @@ export default function App() {
     const [logs, setLogs] = useState([]);
 
     const [copied, setCopied] = useState(false);
+    const [isDragging, setIsDragging] = useState(false);
 
     const peerRef = useRef(null);
     const connRef = useRef(null);
@@ -231,18 +233,17 @@ export default function App() {
                 receivedChunksRef.current = [];
                 receivedSizeRef.current = 0;
                 setReceiveProgress(0);
-                addLog(`Receiving file: ${message.name}`);
+                addLog(`Receiving: ${message.name} (${message.chunked ? "chunked" : "direct"})`);
             }
 
             if (message.type === "file-complete") {
+                // Chunked transfer finished — assemble blob
                 const meta = receiveMetaRef.current;
-                const blob = new Blob(receivedChunksRef.current, {
-                    type: meta.mimeType || "application/octet-stream"
-                });
+                const blob = new Blob(receivedChunksRef.current, { type: meta.mimeType || "application/octet-stream" });
                 const url = URL.createObjectURL(blob);
                 setReceivedFile({ url, name: meta.name });
                 setReceiveProgress(100);
-                addLog(`File ready to download: ${meta.name}`);
+                addLog(`File ready: ${meta.name}`);
                 receiveMetaRef.current = null;
                 receivedChunksRef.current = [];
                 receivedSizeRef.current = 0;
@@ -250,68 +251,75 @@ export default function App() {
             return;
         }
 
-        // Binary chunk — PeerJS may return Uint8Array or ArrayBuffer
+        // Binary data received
+        const meta = receiveMetaRef.current;
+        if (!meta) return;
+
         const buffer = data instanceof ArrayBuffer
             ? data
             : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 
-        receivedChunksRef.current.push(buffer);
-        receivedSizeRef.current += buffer.byteLength;
-
-        const meta = receiveMetaRef.current;
-        if (meta) {
-            const progress = Math.round((receivedSizeRef.current / meta.size) * 100);
-            setReceiveProgress(progress);
+        if (!meta.chunked) {
+            // Direct transfer — entire file in one binary message
+            const blob = new Blob([buffer], { type: meta.mimeType || "application/octet-stream" });
+            const url = URL.createObjectURL(blob);
+            setReceivedFile({ url, name: meta.name });
+            setReceiveProgress(100);
+            addLog(`File ready: ${meta.name}`);
+            receiveMetaRef.current = null;
+        } else {
+            // Chunked transfer — accumulate until file-complete
+            receivedChunksRef.current.push(buffer);
+            receivedSizeRef.current += buffer.byteLength;
+            setReceiveProgress(Math.round((receivedSizeRef.current / meta.size) * 100));
         }
     };
 
     const sendFile = async () => {
         const conn = connRef.current;
+        if (!conn || !channelOpen) { alert("Not connected yet"); return; }
+        if (!selectedFile) { alert("Please select a file"); return; }
 
-        if (!conn || !channelOpen) {
-            alert("Not connected yet");
-            return;
-        }
-
-        if (!selectedFile) {
-            alert("Please select a file");
-            return;
-        }
-
+        const isChunked = selectedFile.size > CHUNK_THRESHOLD;
         setSendProgress(0);
 
         conn.send(JSON.stringify({
             type: "file-meta",
             name: selectedFile.name,
             size: selectedFile.size,
-            mimeType: selectedFile.type
+            mimeType: selectedFile.type,
+            chunked: isChunked
         }));
 
         const arrayBuffer = await selectedFile.arrayBuffer();
-        let offset = 0;
 
-        while (offset < arrayBuffer.byteLength) {
-            const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
-            conn.send(chunk);
-            offset += chunk.byteLength;
+        if (!isChunked) {
+            // ≤ 100 MB — send whole file in one shot for max speed
+            conn.send(arrayBuffer);
+            setSendProgress(100);
+        } else {
+            // > 100 MB — send in 64 KB chunks with backpressure
+            let offset = 0;
+            while (offset < arrayBuffer.byteLength) {
+                const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
+                conn.send(chunk);
+                offset += chunk.byteLength;
+                setSendProgress(Math.round((offset / arrayBuffer.byteLength) * 100));
 
-            const progress = Math.round((offset / arrayBuffer.byteLength) * 100);
-            setSendProgress(progress);
-
-            // Backpressure: pause if underlying DataChannel buffer is filling up
-            const dc = conn.dataChannel;
-            if (dc && dc.bufferedAmount > 1024 * 1024) {
-                await new Promise((resolve) => {
-                    const check = () => {
-                        if (!dc || dc.bufferedAmount < 512 * 1024) resolve();
-                        else setTimeout(check, 50);
-                    };
-                    check();
-                });
+                const dc = conn.dataChannel;
+                if (dc && dc.bufferedAmount > 1024 * 1024) {
+                    await new Promise((resolve) => {
+                        const check = () => {
+                            if (!dc || dc.bufferedAmount < 512 * 1024) resolve();
+                            else setTimeout(check, 50);
+                        };
+                        check();
+                    });
+                }
             }
+            conn.send(JSON.stringify({ type: "file-complete" }));
         }
 
-        conn.send(JSON.stringify({ type: "file-complete" }));
         addLog(`File sent: ${selectedFile.name}`);
     };
 
@@ -432,13 +440,24 @@ export default function App() {
                             )}
                         </div>
 
-                        <label className="file-input-wrapper">
+                        <label
+                            className={`file-input-wrapper${isDragging ? " dragging" : ""}`}
+                            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                            onDragEnter={(e) => { e.preventDefault(); setIsDragging(true); }}
+                            onDragLeave={() => setIsDragging(false)}
+                            onDrop={(e) => {
+                                e.preventDefault();
+                                setIsDragging(false);
+                                const file = e.dataTransfer.files[0];
+                                if (file) setSelectedFile(file);
+                            }}
+                        >
                             <svg viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
                                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                                 <polyline points="17 8 12 3 7 8" />
                                 <line x1="12" y1="3" x2="12" y2="15" />
                             </svg>
-                            <span>{selectedFile ? selectedFile.name : "Click to choose a file"}</span>
+                            <span>{selectedFile ? selectedFile.name : isDragging ? "Drop it!" : "Click or drag a file here"}</span>
                             <input type="file" onChange={(e) => setSelectedFile(e.target.files[0])} />
                         </label>
 
