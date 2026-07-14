@@ -3,34 +3,36 @@ import Peer from "peerjs";
 
 import "./App.css";
 
-const CHUNK_SIZE = 256 * 1024; // 256 KB — 4x fewer messages than 64KB, still well under every browser's real DataChannel message limit
-const BUFFER_HIGH_WATERMARK = 4 * 1024 * 1024; // pause sending once this much is queued
-const BUFFER_LOW_WATERMARK = 1 * 1024 * 1024; // resume once queue drains to this
+const CHUNK_SIZE = 64 * 1024; // 64 KB — safe across Chrome & Firefox, no DataChannel fragmentation
 
 const METERED_API_KEY = import.meta.env.VITE_METERED_API_KEY;
 
-// Hardcoded TURN servers — used when no API key is configured.
-// openrelay.metered.ca accepts these credentials directly on the TURN server.
-const STATIC_ICE_CONFIG = {
+// First-attempt ICE config: STUN only — no TURN.
+// This lets the browser try host (LAN) and srflx (public IP via STUN) candidates first.
+// TURN relay is only used as a fallback (via the Metered API) if both of those fail.
+// The old openrelay.metered.ca static TURN credentials were unreliable and caused ICE
+// to report "failed", which incorrectly triggered the paid Metered TURN fallback.
+const STUN_ONLY_CONFIG = {
+    iceTransportPolicy: "all",
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turns:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-        { urls: "turn:openrelay.metered.ca:80?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
     ]
 };
 
-// When a real Metered.ca API key is set, fetch short-lived signed credentials.
-// These are accepted by the TURN server and won't get rate-limited.
-const fetchIceConfig = async () => {
-    if (!METERED_API_KEY) {
-        console.warn("Metered API key missing. Using static OpenRelay ICE config.");
-        return STATIC_ICE_CONFIG;
+// Returns STUN-only config for the first connection attempt.
+// Pass useApi=true to fetch Metered TURN credentials as a fallback.
+const fetchIceConfig = async (useApi = false) => {
+    if (!useApi || !METERED_API_KEY) {
+        console.log(useApi && !METERED_API_KEY
+            ? "Metered API key missing — no TURN fallback available. Using STUN only."
+            : "Using STUN-only config (host + srflx candidates, no relay cost).");
+        return STUN_ONLY_CONFIG;
     }
 
-    console.log("Metered API key found. Fetching TURN credentials...");
+    console.log("Fetching Metered TURN credentials as fallback...");
 
     try {
         const url = `https://peersdrop.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`;
@@ -52,14 +54,15 @@ const fetchIceConfig = async () => {
         console.log("Metered ICE servers received:", iceServers);
 
         return {
+            iceTransportPolicy: "all",
             iceServers: [
                 { urls: "stun:stun.l.google.com:19302" },
                 ...iceServers
             ]
         };
     } catch (err) {
-        console.error("Failed to fetch Metered TURN credentials. Falling back to static config.", err);
-        return STATIC_ICE_CONFIG;
+        console.error("Failed to fetch Metered TURN credentials. Falling back to STUN only.", err);
+        return STUN_ONLY_CONFIG;
     }
 };
 
@@ -98,7 +101,7 @@ export default function App() {
         setLogs((prev) => [`${new Date().toLocaleTimeString()} - ${message}`, ...prev]);
     };
 
-    const setupConnection = (conn) => {
+    const setupConnection = (conn, onIceFailed) => {
         if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
 
         const onOpen = () => {
@@ -133,48 +136,87 @@ export default function App() {
             addLog(`Connection error: ${err.message}`);
         });
 
-        // Monitor ICE state for early failure detection
+        // Monitor ICE negotiation — attach via addEventListener to avoid clobbering PeerJS internals
         setTimeout(() => {
             const pc = conn.peerConnection;
-            if (!pc) return;
-            pc.oniceconnectionstatechange = () => {
+            if (!pc) {
+                addLog("[ICE] PeerConnection not accessible yet — monitor skipped");
+                return;
+            }
+
+            addLog(`[ICE] Policy: ${pc.getConfiguration?.()?.iceTransportPolicy ?? "all (default)"}`);
+
+            // ── Candidate gathering ──────────────────────────────────────────
+            pc.addEventListener("icecandidate", (event) => {
+                if (!event.candidate) {
+                    addLog("[ICE] Gathering complete — all candidates sent to peer");
+                    return;
+                }
+                const c = event.candidate;
+                const type = c.type || "unknown";
+                const proto = c.protocol || "?";
+                const addr = c.address || "(hidden)";
+                const icon = type === "host" ? "🏠 host" : type === "srflx" ? "🌐 srflx (STUN)" : type === "relay" ? "🔁 relay (TURN)" : `❓ ${type}`;
+                addLog(`[ICE] Candidate: ${icon} | ${proto} | ${addr}`);
+            });
+
+            pc.addEventListener("icecandidateerror", (event) => {
+                addLog(`[ICE] ❌ Candidate error [${event.errorCode}]: ${event.errorText} — ${event.url}`);
+            });
+
+            // ── Gathering state ──────────────────────────────────────────────
+            pc.addEventListener("icegatheringstatechange", () => {
+                addLog(`[ICE] Gathering state → ${pc.iceGatheringState}`);
+            });
+
+            // ── Connection state ─────────────────────────────────────────────
+            pc.addEventListener("iceconnectionstatechange", () => {
                 const s = pc.iceConnectionState;
+                addLog(`[ICE] Connection state → ${s}`);
+
+                if (s === "checking") {
+                    addLog("[ICE] Trying candidate pairs (host → srflx → relay)...");
+                }
+
+                if (s === "connected" || s === "completed") {
+                    clearTimeout(connTimeoutRef.current);
+                    // Log which candidate pair actually won
+                    pc.getStats().then((stats) => {
+                        stats.forEach((report) => {
+                            if (report.type === "candidate-pair" && report.nominated && report.state === "succeeded") {
+                                const local = stats.get(report.localCandidateId);
+                                const remote = stats.get(report.remoteCandidateId);
+                                if (local && remote) {
+                                    addLog(
+                                        `[ICE] ✅ Path selected: local=${local.candidateType}(${local.protocol}) ↔ remote=${remote.candidateType}(${remote.protocol})`
+                                    );
+                                    const costNote = local.candidateType === "relay" || remote.candidateType === "relay"
+                                        ? "⚠ TURN relay is being used — STUN/host paths were unreachable"
+                                        : "👍 Direct path (no TURN relay cost)";
+                                    addLog(`[ICE] ${costNote}`);
+                                }
+                            }
+                        });
+                    }).catch(() => { });
+                }
+
                 if (s === "failed") {
                     clearTimeout(connTimeoutRef.current);
-                    setStatus("ICE connection failed. Network may be blocking P2P. Try a different network.");
-                } else if (s === "connected" || s === "completed") {
-                    clearTimeout(connTimeoutRef.current);
-                    logConnectionType(pc);
+                    if (onIceFailed) {
+                        addLog("[ICE] ❌ All STUN/host paths failed — falling back to API TURN server...");
+                        setStatus("Retrying with TURN server...");
+                        onIceFailed();
+                    } else {
+                        addLog("[ICE] ❌ All paths exhausted (host + srflx + relay). Check firewall/network.");
+                        setStatus("ICE connection failed. Network may be blocking P2P. Try a different network.");
+                    }
                 }
-            };
-        }, 500);
-    };
 
-    // Lets you see, in the log panel, whether the transfer is direct P2P
-    // (fast) or relayed through the TURN server (slow, bandwidth-capped by
-    // that server — no chunk-size tuning fixes that).
-    const logConnectionType = async (pc) => {
-        try {
-            const stats = await pc.getStats();
-            let activePair = null;
-            stats.forEach((report) => {
-                if (report.type === "candidate-pair" && report.state === "succeeded" && report.nominated) {
-                    activePair = report;
+                if (s === "disconnected") {
+                    addLog("[ICE] ⚠ Connection dropped — browser may attempt ICE restart");
                 }
             });
-            if (!activePair) return;
-
-            const local = stats.get(activePair.localCandidateId);
-            const remote = stats.get(activePair.remoteCandidateId);
-
-            if (local?.candidateType === "relay" || remote?.candidateType === "relay") {
-                addLog("⚠ Connection is relayed via TURN — transfer speed is capped by the relay server, not the app.");
-            } else {
-                addLog("✓ Direct P2P connection — good for max transfer speed.");
-            }
-        } catch (err) {
-            // getStats can fail mid-negotiation on some browsers; not critical
-        }
+        }, 500);
     };
 
     const copyRoomId = () => {
@@ -184,12 +226,12 @@ export default function App() {
         });
     };
 
-    const createRoom = async (retryId) => {
+    const createRoom = async (retryId, useApiIce = false) => {
         const newId = typeof retryId === "string" ? retryId : generateRoomId();
         setMode("create");
-        setStatus("Getting TURN credentials...");
+        setStatus(useApiIce ? "Fetching TURN credentials..." : "Connecting...");
 
-        const iceConfig = await fetchIceConfig();
+        const iceConfig = await fetchIceConfig(useApiIce);
 
         const peer = new Peer(newId, { config: iceConfig });
         peerRef.current = peer;
@@ -203,7 +245,10 @@ export default function App() {
 
         peer.on("connection", (conn) => {
             connRef.current = conn;
-            setupConnection(conn);
+            const onIceFailed = (!useApiIce && METERED_API_KEY)
+                ? () => { peer.destroy(); createRoom(newId, true); }
+                : null;
+            setupConnection(conn, onIceFailed);
             addLog("Peer connected to room");
             setStatus("Peer found, connecting...");
         });
@@ -220,15 +265,15 @@ export default function App() {
         });
     };
 
-    const joinRoom = async () => {
+    const joinRoom = async (useApiIce = false, turnRetryCount = 0) => {
         const id = joinInput.trim().toLowerCase();
         if (!id) {
             alert("Please enter a room ID");
             return;
         }
 
-        setStatus("Getting TURN credentials...");
-        const iceConfig = await fetchIceConfig();
+        setStatus(useApiIce ? "Fetching TURN credentials..." : "Connecting...");
+        const iceConfig = await fetchIceConfig(useApiIce);
 
         const peer = new Peer(undefined, { config: iceConfig });
         peerRef.current = peer;
@@ -242,14 +287,27 @@ export default function App() {
 
             const conn = peer.connect(id, { reliable: true });
             connRef.current = conn;
-            setupConnection(conn);
+            const onIceFailed = (!useApiIce && METERED_API_KEY)
+                ? () => { peer.destroy(); joinRoom(true, 0); }
+                : null;
+            setupConnection(conn, onIceFailed);
         });
 
         peer.on("error", (err) => {
             addLog(`Error: ${err.message}`);
             if (err.type === "peer-unavailable") {
-                alert("Room not found. Check the room ID and try again.");
-                disconnect();
+                if (useApiIce && turnRetryCount < 4) {
+                    // Creator is also restarting their peer with TURN at the same time.
+                    // Wait and retry — creator's new room will be ready shortly.
+                    const delay = (turnRetryCount + 1) * 2000; // 2s, 4s, 6s, 8s
+                    addLog(`[ICE] Creator room not ready yet — retrying in ${delay / 1000}s (attempt ${turnRetryCount + 1}/4)...`);
+                    setStatus(`Waiting for creator to reconnect... (${turnRetryCount + 1}/4)`);
+                    peer.destroy();
+                    setTimeout(() => joinRoom(true, turnRetryCount + 1), delay);
+                } else {
+                    alert("Room not found. Check the room ID and try again.");
+                    disconnect();
+                }
             }
         });
     };
@@ -313,41 +371,24 @@ export default function App() {
         }));
 
         const arrayBuffer = await selectedFile.arrayBuffer();
-        const dc = conn.dataChannel;
-        if (dc) dc.bufferedAmountLowThreshold = BUFFER_LOW_WATERMARK;
 
-        // Waits for the 'bufferedamountlow' event instead of polling on a timer —
-        // fires the instant the channel drains, no dead time between chunks.
-        const waitForDrain = () =>
-            new Promise((resolve) => {
-                if (!dc || dc.bufferedAmount <= BUFFER_LOW_WATERMARK) {
-                    resolve();
-                    return;
-                }
-                const onLow = () => {
-                    dc.removeEventListener("bufferedamountlow", onLow);
-                    resolve();
-                };
-                dc.addEventListener("bufferedamountlow", onLow);
-            });
-
+        // Every file is sent in 64 KB chunks with backpressure
         let offset = 0;
-        let lastProgress = 0;
         while (offset < arrayBuffer.byteLength) {
             const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
             conn.send(chunk);
             offset += chunk.byteLength;
+            setSendProgress(Math.round((offset / arrayBuffer.byteLength) * 100));
 
-            // Only touch React state when the displayed % actually changes —
-            // re-rendering on every chunk competes with sending for main-thread time.
-            const pct = Math.round((offset / arrayBuffer.byteLength) * 100);
-            if (pct > lastProgress) {
-                lastProgress = pct;
-                setSendProgress(pct);
-            }
-
-            if (dc && dc.bufferedAmount > BUFFER_HIGH_WATERMARK) {
-                await waitForDrain();
+            const dc = conn.dataChannel;
+            if (dc && dc.bufferedAmount > 1024 * 1024) {
+                await new Promise((resolve) => {
+                    const check = () => {
+                        if (!dc || dc.bufferedAmount < 512 * 1024) resolve();
+                        else setTimeout(check, 50);
+                    };
+                    check();
+                });
             }
         }
         conn.send(JSON.stringify({ type: "file-complete" }));
@@ -455,7 +496,7 @@ export default function App() {
                                 onKeyDown={(e) => e.key === "Enter" && joinRoom()}
                                 placeholder="Paste room ID from the other person"
                             />
-                            <button className="btn-blue" onClick={joinRoom}>Join Room</button>
+                            <button className="btn-blue" onClick={() => joinRoom()}>Join Room</button>
                         </div>
                     </div>
                 ) : (
