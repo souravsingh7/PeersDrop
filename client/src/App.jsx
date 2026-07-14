@@ -438,16 +438,16 @@ export default function App() {
                 {/* ── Header ── */}
                 <div className="header">
                     <div className="header-left">
-                        <div className="brand-icon">
+                        {/* <div className="brand-icon">
                             <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
-                        </div>
-                        <div className="header-text">
-                            <h1>Share Files Instantly</h1>
-                            <p className="subtitle">Secure peer-to-peer file transfer using WebRTC. Fast, private, and simple.</p>
-                        </div>
+                        </div> */}
+                        {/* <div className="header-text">
+                            <h1>Connect Instantly</h1>
+                            <p className="subtitle">Connected with friends</p>
+                        </div> */}
                     </div>
                     <div className="header-illustration">
-                        <div className="folder-icon blue">
+                        {/* <div className="folder-icon blue">
                             <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
                         </div>
                         <div className="transfer-arrow">
@@ -455,7 +455,7 @@ export default function App() {
                         </div>
                         <div className="folder-icon violet">
                             <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
-                        </div>
+                        </div> */}
                     </div>
                 </div>
 
@@ -470,12 +470,12 @@ export default function App() {
                 {!joined ? (
                     <div className="lobby">
                         <div className="lobby-option">
-                            <div className="option-icon green">
-                                <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+                            <div className="option-iconm greenn">
+                                {/* <sv viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg> */}
                             </div>
-                            <h3>Create a Room</h3>
-                            <p>Generate a room ID and share it with the other person.</p>
-                            <button className="btn-green" onClick={() => createRoom()}>Create Room</button>
+                            <h3>Create</h3>
+                            {/* <p>Generate a room ID and share it with the other person.</p> */}
+                            <button className="btn-green" onClick={() => createRoom()}>Create</button>
                         </div>
 
                         <div className="lobby-divider">
@@ -485,18 +485,18 @@ export default function App() {
                         </div>
 
                         <div className="lobby-option">
-                            <div className="option-icon blue">
-                                <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></svg>
+                            <div className="option-iconk blued">
+                                {/* <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></svg> */}
                             </div>
-                            <h3>Join a Room</h3>
-                            <p>Enter the room ID shared by the other person.</p>
+                            <h3>Join</h3>
+                            {/* <p>Enter the room ID shared by the other person.</p> */}
                             <input
                                 value={joinInput}
                                 onChange={(e) => setJoinInput(e.target.value)}
                                 onKeyDown={(e) => e.key === "Enter" && joinRoom()}
-                                placeholder="Paste room ID from the other person"
+                                placeholder=""
                             />
-                            <button className="btn-blue" onClick={() => joinRoom()}>Join Room</button>
+                            <button className="btn-blue" onClick={() => joinRoom()}>Join</button>
                         </div>
                     </div>
                 ) : (
@@ -542,7 +542,7 @@ export default function App() {
 
                         <div className="action-row">
                             <button className="btn-blue" onClick={sendFile} disabled={!channelOpen}>
-                                Send File
+                                Send
                             </button>
                             <button className="btn-danger" onClick={disconnect}>Disconnect</button>
                         </div>
@@ -571,7 +571,7 @@ export default function App() {
                                         }, 1000);
                                     }}
                                 >
-                                    ⬇ Download
+                                    ⬇ Save
                                 </a>
                             </div>
                         )}
