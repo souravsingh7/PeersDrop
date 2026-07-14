@@ -116,7 +116,13 @@ export default function App() {
             onOpen();
         } else {
             connTimeoutRef.current = setTimeout(() => {
-                setStatus("Connection timed out. Check your network and try again.");
+                if (onIceFailed) {
+                    addLog("[ICE] COnnection Timed out moving to Turn Server");
+                    setStatus("Retrying  with TURn server....");
+
+                } else {
+                    setStatus("Connection timed out. Check your network and try again.");
+                }
             }, 30000);
             conn.on("open", onOpen);
         }
