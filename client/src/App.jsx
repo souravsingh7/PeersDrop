@@ -104,6 +104,17 @@ export default function App() {
     const setupConnection = (conn, onIceFailed) => {
         if (connTimeoutRef.current) clearTimeout(connTimeoutRef.current);
 
+        // One-shot guard: the TURN fallback must only fire once.
+        // Without this, the 30s timeout AND the iceconnectionstate "failed" event
+        // both fire after peer.destroy(), spawning two competing TURN attempts.
+        let iceFallback = onIceFailed;
+        const triggerFallback = () => {
+            if (!iceFallback) return;
+            const fn = iceFallback;
+            iceFallback = null;
+            fn();
+        };
+
         const onOpen = () => {
             clearTimeout(connTimeoutRef.current);
             setChannelOpen(true);
@@ -116,10 +127,10 @@ export default function App() {
             onOpen();
         } else {
             connTimeoutRef.current = setTimeout(() => {
-                if (onIceFailed) {
-                    addLog("[ICE] COnnection Timed out moving to Turn Server");
-                    setStatus("Retrying  with TURn server....");
-
+                if (iceFallback) {
+                    addLog("[ICE] ⏱ Connection timed out — STUN/host paths too slow. Falling back to TURN relay...");
+                    setStatus("Retrying with TURN server...");
+                    triggerFallback();
                 } else {
                     setStatus("Connection timed out. Check your network and try again.");
                 }
@@ -208,10 +219,10 @@ export default function App() {
 
                 if (s === "failed") {
                     clearTimeout(connTimeoutRef.current);
-                    if (onIceFailed) {
+                    if (iceFallback) {
                         addLog("[ICE] ❌ All STUN/host paths failed — falling back to API TURN server...");
                         setStatus("Retrying with TURN server...");
-                        onIceFailed();
+                        triggerFallback();
                     } else {
                         addLog("[ICE] ❌ All paths exhausted (host + srflx + relay). Check firewall/network.");
                         setStatus("ICE connection failed. Network may be blocking P2P. Try a different network.");
