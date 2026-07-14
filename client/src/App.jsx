@@ -134,7 +134,7 @@ export default function App() {
                 } else {
                     setStatus("Connection timed out. Check your network and try again.");
                 }
-            }, 30000);
+            }, 15000);
             conn.on("open", onOpen);
         }
 
